@@ -1,314 +1,16 @@
 //
-//  清醒 (Qingxing) — macOS 菜单栏防睡眠小工具
+//  清醒 Qingxing v1.1.0 — macOS 菜单栏防睡眠小工具
 //
-//  三种模式：
-//    1. 合盖继续工作   —— pmset disablesleep（需一次管理员授权）
-//    2. 关屏继续工作   —— IOKit 系统断言（屏幕可熄、任务不断）
-//    3. 屏幕常亮       —— IOKit 显示断言（不熄屏、不休眠）
-//  生效条件：始终 / 仅插电源时 / 仅用电池时
+//  功能：合盖/关屏/常亮三种模式 · 按电源条件生效 · App 触发 · 免密模式
+//        电池阈值保护 · 启动自检 · SwiftUI 设置面板
 //
 //  构建：./build.sh
 //
 
 import AppKit
-import IOKit.pwr_mgt
-import IOKit.ps
 import ServiceManagement
-
-// MARK: - 生效条件
-
-enum PowerScope: Int, CaseIterable {
-    case always = 0
-    case acOnly = 1
-    case batteryOnly = 2
-
-    var label: String {
-        switch self {
-        case .always: return "始终生效"
-        case .acOnly: return "仅插电源时生效"
-        case .batteryOnly: return "仅用电池时生效"
-        }
-    }
-
-    var pmsetProfile: String {
-        switch self {
-        case .always: return "-a"
-        case .acOnly: return "-c"
-        case .batteryOnly: return "-b"
-        }
-    }
-
-    func active(onAC: Bool) -> Bool {
-        switch self {
-        case .always: return true
-        case .acOnly: return onAC
-        case .batteryOnly: return !onAC
-        }
-    }
-}
-
-// MARK: - 电源状态监控
-
-final class PowerMonitor {
-    private var runLoopSource: CFRunLoopSource?
-    var onChange: (() -> Void)?
-
-    private(set) var onAC: Bool = true
-    private(set) var hasBattery: Bool = false
-
-    init() {
-        refresh()
-        let callback: IOPowerSourceCallbackType = { context in
-            guard let context = context else { return }
-            let monitor = Unmanaged<PowerMonitor>.fromOpaque(context).takeUnretainedValue()
-            monitor.refresh()
-            monitor.onChange?()
-        }
-        let pointer = Unmanaged.passUnretained(self).toOpaque()
-        if let source = IOPSNotificationCreateRunLoopSource(callback, pointer)?.takeRetainedValue() {
-            runLoopSource = source
-            CFRunLoopAddSource(CFRunLoopGetMain(), source, .defaultMode)
-        }
-    }
-
-    deinit {
-        if let source = runLoopSource {
-            CFRunLoopRemoveSource(CFRunLoopGetMain(), source, .defaultMode)
-        }
-    }
-
-    func refresh() {
-        guard let snapshot = IOPSCopyPowerSourcesInfo()?.takeRetainedValue(),
-              let list = IOPSCopyPowerSourcesList(snapshot)?.takeRetainedValue() as? [AnyObject],
-              !list.isEmpty else {
-            // 没有电池设备（台式机 / 未装电池），视为一直插电
-            hasBattery = false
-            onAC = true
-            return
-        }
-        hasBattery = true
-        var ac = true
-        for source in list {
-            if let description = IOPSGetPowerSourceDescription(snapshot, source)?.takeUnretainedValue() as? [String: Any],
-               let state = description[kIOPSPowerSourceStateKey] as? String,
-               state == kIOPSBatteryPowerValue {
-                ac = false
-            }
-        }
-        onAC = ac
-    }
-}
-
-// MARK: - IOKit 电源断言（无需权限）
-
-final class AssertionManager {
-    private var systemAssertionID: IOPMAssertionID = 0
-    private var displayAssertionID: IOPMAssertionID = 0
-
-    var systemHeld: Bool { systemAssertionID != 0 }
-    var displayHeld: Bool { displayAssertionID != 0 }
-
-    @discardableResult
-    func setSystemAwake(_ on: Bool) -> Bool {
-        if on {
-            guard systemAssertionID == 0 else { return true }
-            var id: IOPMAssertionID = 0
-            let result = IOPMAssertionCreateWithName(
-                kIOPMAssertionTypePreventUserIdleSystemSleep as CFString,
-                IOPMAssertionLevel(kIOPMAssertionLevelOn),
-                "Qingxing: system awake (display may sleep)" as CFString,
-                &id)
-            if result == kIOReturnSuccess {
-                systemAssertionID = id
-                return true
-            }
-            return false
-        } else {
-            guard systemAssertionID != 0 else { return true }
-            let ok = IOPMAssertionRelease(systemAssertionID) == kIOReturnSuccess
-            systemAssertionID = 0
-            return ok
-        }
-    }
-
-    @discardableResult
-    func setDisplayAwake(_ on: Bool) -> Bool {
-        if on {
-            guard displayAssertionID == 0 else { return true }
-            var id: IOPMAssertionID = 0
-            let result = IOPMAssertionCreateWithName(
-                kIOPMAssertionTypePreventUserIdleDisplaySleep as CFString,
-                IOPMAssertionLevel(kIOPMAssertionLevelOn),
-                "Qingxing: display awake" as CFString,
-                &id)
-            if result == kIOReturnSuccess {
-                displayAssertionID = id
-                return true
-            }
-            return false
-        } else {
-            guard displayAssertionID != 0 else { return true }
-            let ok = IOPMAssertionRelease(displayAssertionID) == kIOReturnSuccess
-            displayAssertionID = 0
-            return ok
-        }
-    }
-}
-
-// MARK: - pmset 封装
-
-enum PMSet {
-    /// 同步执行 pmset（只用于无需 root 的查询 / displaysleepnow）
-    @discardableResult
-    static func run(_ arguments: [String]) -> String? {
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/usr/bin/pmset")
-        process.arguments = arguments
-        let pipe = Pipe()
-        process.standardOutput = pipe
-        process.standardError = Pipe()
-        do {
-            try process.run()
-            process.waitUntilExit()
-        } catch {
-            return nil
-        }
-        guard process.terminationStatus == 0 else { return nil }
-        let data = pipe.fileHandleForReading.readDataToEndOfFile()
-        return String(data: data, encoding: .utf8)
-    }
-
-    /// 读取合盖睡眠开关的实际状态。
-    /// 注意：macOS 26+ 的 `pmset -g custom` 不再列出 disablesleep，
-    /// 权威位置是 `pmset -g` 输出里的 SleepDisabled（live 值）；
-    /// 旧系统若 custom 里区分了电源配置，则用它细化。
-    static func lidSleepDisabled() -> (battery: Bool, ac: Bool) {
-        var live = false
-        if let text = run(["-g"]) {
-            for rawLine in text.split(separator: "\n") {
-                let line = rawLine.trimmingCharacters(in: .whitespaces)
-                if line.hasPrefix("SleepDisabled") { live = line.contains("1") }
-            }
-        }
-        var battery = live
-        var ac = live
-        var section = ""
-        var sawCustomDetail = false
-        if let text = run(["-g", "custom"]) {
-            for rawLine in text.split(separator: "\n") {
-                let line = rawLine.trimmingCharacters(in: .whitespaces)
-                if line.hasPrefix("Battery") { section = "b"; continue }
-                if line.hasPrefix("AC") { section = "a"; continue }
-                if line.hasPrefix("UPS") { section = ""; continue }
-                if line.hasPrefix("disablesleep") {
-                    sawCustomDetail = true
-                    let on = line.contains("1")
-                    if section == "b" { battery = on }
-                    if section == "a" { ac = on }
-                }
-            }
-        }
-        if !sawCustomDetail {
-            battery = live
-            ac = live
-        }
-        return (battery, ac)
-    }
-
-    enum PrivilegedResult { case ok, cancelled, failed }
-
-    /// 以管理员权限执行命令（弹出系统授权对话框），返回结果和真实错误信息
-    static func runPrivileged(_ command: String) -> (result: PrivilegedResult, message: String) {
-        let escaped = command
-            .replacingOccurrences(of: "\\", with: "\\\\")
-            .replacingOccurrences(of: "\"", with: "\\\"")
-        let source = "do shell script \"\(escaped)\" with administrator privileges with prompt \"「清醒」修改合盖睡眠设置需要管理员权限\""
-        var error: NSDictionary?
-        NSAppleScript(source: source)?.executeAndReturnError(&error)
-        if error == nil { return (.ok, "") }
-        let number = (error?[NSAppleScript.errorNumber] as? Int) ?? 0
-        let message = (error?[NSAppleScript.errorMessage] as? String)
-            ?? (error?[NSAppleScript.errorBriefMessage] as? String)
-            ?? "未知错误"
-        // -128 = 用户取消了授权对话框
-        return (number == -128 ? .cancelled : .failed, message)
-    }
-
-    /// 记录启用合盖模式前各电源配置的闲置睡眠时长（分钟），关闭时恢复
-    private static func saveSleepTimers() {
-        let defaults = UserDefaults.standard
-        guard defaults.object(forKey: "savedSleepB") == nil else { return }
-        guard let text = run(["-g", "custom"]) else { return }
-        var section = ""
-        for rawLine in text.split(separator: "\n") {
-            let line = rawLine.trimmingCharacters(in: .whitespaces)
-            if line.hasPrefix("Battery") { section = "b"; continue }
-            if line.hasPrefix("AC") { section = "a"; continue }
-            if line.hasPrefix("UPS") { section = ""; continue }
-            let parts = line.components(separatedBy: .whitespaces).filter { !$0.isEmpty }
-            if parts.first == "sleep", parts.count >= 2, let minutes = Int(parts[1]) {
-                if section == "b" { defaults.set(minutes, forKey: "savedSleepB") }
-                if section == "a" { defaults.set(minutes, forKey: "savedSleepC") }
-            }
-        }
-    }
-
-    private static func restoredSleepCommands() -> [String] {
-        let defaults = UserDefaults.standard
-        var commands: [String] = []
-        if let battery = defaults.object(forKey: "savedSleepB") as? Int {
-            commands.append("-b sleep \(battery)")
-        }
-        if let ac = defaults.object(forKey: "savedSleepC") as? Int {
-            commands.append("-c sleep \(ac)")
-        }
-        return commands
-    }
-
-    private static func clearSavedSleepTimers() {
-        let defaults = UserDefaults.standard
-        defaults.removeObject(forKey: "savedSleepB")
-        defaults.removeObject(forKey: "savedSleepC")
-    }
-
-    /// 设置合盖睡眠开关。返回 (是否成功, 是否退回了全局设置, 是否被用户取消, 错误信息)
-    /// macOS 26/27 上仅设 disablesleep 在电池下可能仍被闲置睡眠策略覆盖，
-    /// 因此开启时同步把对应配置的 sleep 计时改为 0，关闭时恢复原值。
-    static func setLidSleepDisabled(_ disabled: Bool, profile: String) -> (ok: Bool, usedGlobalFallback: Bool, cancelled: Bool, message: String) {
-        func command(for profile: String) -> String {
-            if disabled {
-                saveSleepTimers()
-                return "/usr/bin/pmset \(profile) disablesleep 1; /usr/bin/pmset \(profile) sleep 0"
-            }
-            var restore = "/usr/bin/pmset -a disablesleep 0"
-            for item in restoredSleepCommands() {
-                restore += "; /usr/bin/pmset \(item)"
-            }
-            return restore
-        }
-        switch runPrivileged(command(for: profile)) {
-        case (.ok, _):
-            if !disabled { clearSavedSleepTimers() }
-            return (true, false, false, "")
-        case (.cancelled, let message):
-            return (false, false, true, message)
-        case (.failed, let message):
-            // 个别系统版本不支持按电源配置设置 disablesleep，退回全局
-            if profile != "-a" {
-                switch runPrivileged(command(for: "-a")) {
-                case (.ok, _):
-                    if !disabled { clearSavedSleepTimers() }
-                    return (true, true, false, "")
-                case (.cancelled, let message2):
-                    return (false, false, true, message2)
-                case (.failed, let message2):
-                    return (false, false, false, message2)
-                }
-            }
-            return (false, false, false, message)
-        }
-    }
-}
+import SwiftUI
+import UniformTypeIdentifiers
 
 // MARK: - 应用主体
 
@@ -317,30 +19,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private let menu = NSMenu()
     private let power = PowerMonitor()
     private let assertions = AssertionManager()
-    private var lidOnCached = false
+    private let triggers = AppTriggerMonitor()
+    private let state = AppState()
 
-    // MARK: 持久化设置
+    private var settingsWindow: NSWindow?
+    private var batteryGuardTripped = false
 
-    private var systemAwakeOn: Bool {
-        get { UserDefaults.standard.bool(forKey: "systemAwakeOn") }
-        set { UserDefaults.standard.set(newValue, forKey: "systemAwakeOn") }
-    }
-
-    private var displayAwakeOn: Bool {
-        get { UserDefaults.standard.bool(forKey: "displayAwakeOn") }
-        set { UserDefaults.standard.set(newValue, forKey: "displayAwakeOn") }
-    }
-
-    private var scopeRaw: Int {
-        get { UserDefaults.standard.integer(forKey: "powerScope") }
-        set { UserDefaults.standard.set(newValue, forKey: "powerScope") }
-    }
-
-    private var scope: PowerScope { PowerScope(rawValue: scopeRaw) ?? .always }
+    private lazy var panelActions = PanelActions(
+        toggleLid: { [weak self] in self?.performLidToggle() },
+        screenOffNow: { [weak self] in self?.screenOffNow() },
+        pickApp: { [weak self] in self?.pickApp() },
+        installHelper: { [weak self] in self?.installHelper() },
+        uninstallHelper: { [weak self] in self?.uninstallHelper() },
+        toggleLoginItem: { [weak self] in self?.toggleLoginItem() },
+        restoreDefaults: { [weak self] in self?.restoreDefaults() }
+    )
 
     // MARK: 生命周期
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        state.onSettingsChange = { [weak self] in self?.applyAll() }
+
         if let button = statusItem.button {
             button.image = iconImage(active: false)
         }
@@ -348,39 +47,86 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.delegate = self
 
         power.onChange = { [weak self] in
-            self?.applyAssertions()
+            self?.powerChanged()
         }
-        let lid = PMSet.lidSleepDisabled()
-        lidOnCached = lid.battery || lid.ac
-        applyAssertions()
+
+        state.helperInstalled = PrivilegedHelper.refresh()
+        refreshLidState()
+        refreshPowerText()
+        applyAll()
+
+        // 监听 App 启动/退出，重新评估触发
+        let center = NotificationCenter.default
+        center.addObserver(forName: NSWorkspace.didLaunchApplicationNotification, object: nil, queue: .main) { [weak self] _ in
+            self?.applyAll()
+        }
+        center.addObserver(forName: NSWorkspace.didTerminateApplicationNotification, object: nil, queue: .main) { [weak self] _ in
+            self?.applyAll()
+        }
 
         if !UserDefaults.standard.bool(forKey: "welcomed") {
             UserDefaults.standard.set(true, forKey: "welcomed")
             showWelcome()
         }
+
+        // 命令行 --show-settings 直接打开设置面板（供测试/自动化）
+        if CommandLine.arguments.contains("--show-settings") {
+            showSettings()
+        }
+
+        // 启动自检（稍等电源/通知中心就绪）
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in
+            self?.startupSelfCheck()
+        }
     }
 
-    // MARK: 状态计算
+    // MARK: 状态计算与应用
 
-    /// 断言类开关在当前电源下是否应生效
-    private var assertionsEffective: Bool {
-        scope.active(onAC: power.onAC)
+    private var scopeActive: Bool {
+        state.powerScope.active(onAC: power.onAC) && !batteryGuardTripped
     }
 
-    private func applyAssertions() {
-        let shouldHold = assertionsEffective
-        assertions.setSystemAwake(systemAwakeOn && shouldHold)
-        assertions.setDisplayAwake(displayAwakeOn && shouldHold)
+    private func applyAll() {
+        let active = scopeActive
+        assertions.setSystemAwake(state.systemAwakeOn && active)
+        assertions.setDisplayAwake(state.displayAwakeOn && active)
+        triggers.reevaluate(triggers: state.triggerApps, allowed: active)
+        state.activeTriggerNames = triggers.activeNames
+        state.guardTripped = batteryGuardTripped
+        updateIcon()
+    }
+
+    private func powerChanged() {
+        refreshPowerText()
+        batteryGuardCheck()
+        applyAll()
+    }
+
+    private func refreshPowerText() {
+        if !power.hasBattery {
+            state.powerText = "🖥️  电源：未检测到电池"
+        } else if power.onAC {
+            state.powerText = "🔌  电源：交流电源（插电中）"
+        } else {
+            let percent = power.batteryPercent.map { " · \($0)%" } ?? ""
+            state.powerText = "🔋  电源：电池供电中\(percent)"
+        }
+    }
+
+    private func refreshLidState() {
+        let lid = PMSet.lidSleepDisabled()
+        state.lidOn = lid.battery || lid.ac
         updateIcon()
     }
 
     private func updateIcon() {
-        let active = assertions.systemHeld || assertions.displayHeld || lidOnCached
+        let active = state.lidOn || assertions.systemHeld || assertions.displayHeld || triggers.held
         statusItem.button?.image = iconImage(active: active)
         var tips: [String] = []
-        if lidOnCached { tips.append("合盖继续工作") }
+        if state.lidOn { tips.append("合盖继续工作") }
         if assertions.systemHeld { tips.append("关屏继续工作") }
         if assertions.displayHeld { tips.append("屏幕常亮") }
+        if triggers.held { tips.append("App 触发（" + triggers.activeNames.joined(separator: "、") + "）") }
         statusItem.button?.toolTip = tips.isEmpty
             ? "「清醒」— Mac 当前可正常睡眠"
             : "「清醒」保持清醒中：" + tips.joined(separator: "、")
@@ -395,6 +141,77 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         return image
     }
 
+    // MARK: 电池保护
+
+    private func batteryGuardCheck() {
+        guard state.batteryGuardOn, power.hasBattery, !power.onAC,
+              let percent = power.batteryPercent else {
+            batteryGuardTripped = false
+            state.guardTripped = false
+            return
+        }
+        guard percent <= state.batteryThreshold else {
+            batteryGuardTripped = false
+            state.guardTripped = false
+            return
+        }
+        guard !batteryGuardTripped else { return }
+        batteryGuardTripped = true
+        state.guardTripped = true
+
+        // 断言类模式直接关（无需权限）
+        if state.systemAwakeOn || state.displayAwakeOn {
+            state.systemAwakeOn = false
+            state.displayAwakeOn = false
+        }
+
+        // 合盖模式：免密则静默关闭；否则只能通知用户手动处理
+        var lidHandled = true
+        if state.lidOn {
+            let result = PMSet.setLidSleepDisabled(false, profile: "-a", interactive: false)
+            if result.ok {
+                refreshLidState()
+            } else {
+                lidHandled = false
+            }
+        }
+
+        if lidHandled {
+            Notify.send("清醒 · 电池保护", body: "电量已低于 \(percent)%，已自动关闭所有防睡眠模式，恢复系统正常睡眠。")
+        } else {
+            Notify.send("清醒 · 电池保护", body: "电量已低于 \(percent)%，已关闭免权限的防睡眠模式。\"合盖继续工作\"需要密码才能关闭——点击菜单栏 🌙 图标选择\"恢复 macOS 默认\"，或在设置中安装免密组件实现全自动保护。")
+        }
+        applyAll()
+    }
+
+    // MARK: 启动自检
+
+    private func startupSelfCheck() {
+        let defaults = UserDefaults.standard
+        guard defaults.object(forKey: "savedSleepB") != nil || defaults.object(forKey: "savedSleepC") != nil else {
+            return
+        }
+        let lid = PMSet.lidSleepDisabled()
+        if lid.battery || lid.ac {
+            // 合盖模式还开着：保存的睡眠计时是将来关闭时恢复用的，属于正常
+            return
+        }
+        // 合盖已关但保存值还在 → 检查闲置睡眠是否仍被改成"永不"（异常退出残留）
+        let savedB = defaults.object(forKey: "savedSleepB") as? Int ?? 0
+        let savedC = defaults.object(forKey: "savedSleepC") as? Int ?? 0
+        let current = PMSet.sleepTimers()
+        if (current.battery == 0 && savedB > 0) || (current.ac == 0 && savedC > 0) {
+            let result = PMSet.setLidSleepDisabled(false, profile: "-a", interactive: false)
+            if result.ok {
+                Notify.send("清醒 · 启动自检", body: "检测到上次异常退出的残留设置（闲置睡眠被改为\"永不\"），已自动恢复原值。")
+            } else {
+                Notify.send("清醒 · 启动自检", body: "检测到残留设置：闲置睡眠计时仍为\"永不\"。请点击菜单栏图标选择\"恢复 macOS 默认\"修复（需要密码）。")
+            }
+        } else {
+            PMSet.clearSavedSleepTimers()
+        }
+    }
+
     // MARK: 菜单
 
     func menuNeedsUpdate(_ menu: NSMenu) {
@@ -404,67 +221,65 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func rebuildMenu() {
         menu.removeAllItems()
         power.refresh()
-        let lid = PMSet.lidSleepDisabled()
-        lidOnCached = lid.battery || lid.ac
-        updateIcon()
+        refreshPowerText()
+        refreshLidState()
+        state.helperInstalled = PrivilegedHelper.refresh()
+        state.loginItemEnabled = SMAppService.mainApp.status == .enabled
 
         // —— 状态区 ——
-        let powerText: String
-        if !power.hasBattery {
-            powerText = "🖥️  电源：未检测到电池"
-        } else {
-            powerText = power.onAC ? "🔌  电源：交流电源（插电中）" : "🔋  电源：电池供电中"
-        }
-        addItem(powerText, enabled: false)
+        addItem(state.powerText, enabled: false)
 
         var active: [String] = []
-        if lid.ac || lid.battery {
-            var label = "合盖继续工作"
-            if lid.ac != lid.battery {
-                label += lid.ac ? "（插电源时）" : "（用电池时）"
-            }
-            active.append(label)
-        }
+        if state.lidOn { active.append("合盖继续工作") }
         if assertions.systemHeld { active.append("关屏继续工作") }
         if assertions.displayHeld { active.append("屏幕常亮") }
+        if !state.activeTriggerNames.isEmpty {
+            active.append("App 触发（" + state.activeTriggerNames.joined(separator: "、") + "）")
+        }
 
         if active.isEmpty {
             addItem("😴  Mac 可正常睡眠（未开启任何模式）", enabled: false)
         } else {
             addItem("✅  保持清醒中：" + active.joined(separator: "、"), enabled: false)
         }
-        if (systemAwakeOn || displayAwakeOn) && !assertionsEffective {
-            addItem("⏸️  当前电源不满足生效条件（\(scope.label)），暂不生效", enabled: false)
+        if (state.systemAwakeOn || state.displayAwakeOn) && !scopeActive {
+            addItem("⏸️  当前电源不满足生效条件（\(state.powerScope.label)），暂不生效", enabled: false)
+        }
+        if state.guardTripped {
+            addItem("🛡️  电池低于阈值，已自动恢复睡眠", enabled: false)
         }
 
         menu.addItem(.separator())
 
         // —— 模式开关 ——
         let lidItem = addItem("🌙  合盖继续工作（扣盖不休眠）", action: #selector(toggleLid(_:)))
-        lidItem.state = lidOnCached ? .on : .off
-        lidItem.toolTip = "合上盖子（扣盖）后 Mac 继续运行，屏幕关闭、任务不断。\n通过系统 pmset 修改 disablesleep 设置，首次切换需要输入一次管理员密码。\n⚠️ 合盖运行时请注意散热；用电池时也会持续耗电。"
+        lidItem.state = state.lidOn ? .on : .off
+        lidItem.toolTip = "合上盖子（扣盖）后 Mac 继续运行，屏幕关闭、任务不断。\n\(state.helperInstalled ? "免密已启用，切换无需密码。" : "切换需要输入管理员密码（可在设置中安装免密组件）。")\n⚠️ 合盖运行时请注意散热；用电池时也会持续耗电。"
 
         let systemItem = addItem("🌑  关屏继续工作（屏幕可熄、任务不断）", action: #selector(toggleSystemAwake(_:)))
-        systemItem.state = systemAwakeOn ? .on : .off
-        systemItem.toolTip = "系统保持唤醒，屏幕到时间会正常熄灭（也可点“立即关屏”）。\n下载、编译、跑任务都不中断。基于 IOKit 断言实现，无需任何权限。"
+        systemItem.state = state.systemAwakeOn ? .on : .off
+        systemItem.toolTip = "系统保持唤醒，屏幕到时间会正常熄灭（也可点\"立即关屏\"）。\n下载、编译、跑任务都不中断。基于 IOKit 断言实现，无需任何权限。"
 
         let displayItem = addItem("☀️  屏幕常亮（不熄屏、不休眠）", action: #selector(toggleDisplayAwake(_:)))
-        displayItem.state = displayAwakeOn ? .on : .off
+        displayItem.state = state.displayAwakeOn ? .on : .off
         displayItem.toolTip = "屏幕和系统都不进入睡眠，相当于一直 caffeinate -d。"
 
-        let screenOff = addItem("⏻  一键：立即关屏并继续工作", action: #selector(screenOffNow(_:)))
-        screenOff.toolTip = "自动打开“关屏继续工作”，然后立即熄灭屏幕；任务继续运行。\n按任意键 / 动一下鼠标即可点亮屏幕。"
+        let triggerItem = addItem("🎯  App 触发\(state.activeTriggerNames.isEmpty ? "" : "：\(state.activeTriggerNames.joined(separator: "、"))")", action: #selector(openSettings(_:)))
+        triggerItem.toolTip = "在设置面板中管理：指定 App 运行时自动保持唤醒。"
+
+        let screenOff = addItem("⏻  一键：立即关屏并继续工作", action: #selector(screenOffAction(_:)))
+        screenOff.toolTip = "自动打开\"关屏继续工作\"，然后立即熄灭屏幕；任务继续运行。\n按任意键 / 动一下鼠标即可点亮屏幕。"
 
         menu.addItem(.separator())
 
         // —— 生效条件 ——
         let scopeItem = addItem("⚡  生效条件（对以上模式）")
-        scopeItem.toolTip = "决定各模式在什么电源状态下生效。\n· 断言类模式（关屏/常亮）：切换电源时自动生效或恢复。\n· 合盖模式：按 pmset 的对应电源配置设置（修改后请重新开关一次合盖模式）。"
+        scopeItem.toolTip = "决定各模式在什么电源状态下生效。\n· 断言类模式（关屏/常亮/App 触发）：切换电源时自动生效或恢复。\n· 合盖模式：按 pmset 的对应电源配置设置（修改后请重新开关一次合盖模式）。"
         let submenu = NSMenu()
         for s in PowerScope.allCases {
             let item = NSMenuItem(title: s.label, action: #selector(setScope(_:)), keyEquivalent: "")
             item.target = self
-            item.state = (s.rawValue == scopeRaw) ? .on : .off
+            item.state = (s == state.powerScope) ? .on : .off
             item.representedObject = s.rawValue
             switch s {
             case .always: item.toolTip = "无论插不插电源，三种模式都生效"
@@ -478,11 +293,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.addItem(.separator())
 
         // —— 其他 ——
-        let restore = addItem("↩️  恢复 macOS 默认（允许正常睡眠）", action: #selector(restoreDefaults(_:)))
+        let settings = addItem("⚙️  设置…", action: #selector(openSettings(_:)))
+        settings.keyEquivalent = ","
+        settings.keyEquivalentModifierMask = .command
+
+        let restore = addItem("↩️  恢复 macOS 默认（允许正常睡眠）", action: #selector(restoreDefaultsAction(_:)))
         restore.toolTip = "关闭所有模式，并清除 pmset 的 disablesleep 设置（需要管理员密码）"
 
         let loginItem = addItem("🚀  登录时自动启动", action: #selector(toggleLaunchAtLogin(_:)))
-        loginItem.state = (SMAppService.mainApp.status == .enabled) ? .on : .off
+        loginItem.state = state.loginItemEnabled ? .on : .off
 
         addItem("ℹ️  关于「清醒」", action: #selector(showAbout(_:)))
         addItem("✕  退出", action: #selector(NSApplication.terminate(_:)), targetSelf: false)
@@ -497,75 +316,150 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         return item
     }
 
+    // MARK: 设置面板
+
+    private func showSettings() {
+        if settingsWindow == nil {
+            let window = NSWindow(
+                contentViewController: NSHostingController(
+                    rootView: SettingsView(state: state, actions: panelActions)))
+            window.title = "清醒 · 设置"
+            window.styleMask.insert(.closable)
+            window.styleMask.insert(.miniaturizable)
+            window.isReleasedWhenClosed = false
+            window.setContentSize(NSSize(width: 520, height: 840))
+            window.center()
+            settingsWindow = window
+        }
+        settingsWindow?.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+    }
+
+    private func pickApp() {
+        let panel = NSOpenPanel()
+        panel.title = "选择要监视的 App"
+        panel.message = "这些 App 运行时，自动保持 Mac 唤醒（屏幕可熄灭）"
+        panel.allowedContentTypes = [UTType.application]
+        panel.directoryURL = URL(fileURLWithPath: "/Applications")
+        panel.allowsMultipleSelection = false
+        panel.canChooseDirectories = false
+        NSApp.activate(ignoringOtherApps: true)
+        guard panel.runModal() == .OK, let url = panel.url,
+              let bundle = Bundle(url: url), let bundleId = bundle.bundleIdentifier else { return }
+        let name = FileManager.default.displayName(atPath: url.path)
+        if !state.triggerApps.contains(where: { $0.bundleId == bundleId }) {
+            state.triggerApps.append(TriggerApp(bundleId: bundleId, name: name))
+            applyAll()
+        }
+    }
+
+    // MARK: 免密组件
+
+    private func installHelper() {
+        let result = PrivilegedHelper.install()
+        state.helperInstalled = PrivilegedHelper.isInstalled
+        if result.ok {
+            NSApp.activate(ignoringOtherApps: true)
+            let alert = NSAlert()
+            alert.messageText = "免密模式已启用"
+            alert.informativeText = "以后切换\"合盖继续工作\"、电池低电量自动保护都不再需要密码。\n\n已写入：\n· /usr/local/bin/qingxing-privileged（白名单助手，只接受固定的 pmset 变更）\n· /etc/sudoers.d/qingxing（仅允许当前用户免密执行该助手）\n\n可随时在设置中卸载。"
+            alert.runModal()
+        } else {
+            showAlert("安装失败", informative: result.message)
+        }
+    }
+
+    private func uninstallHelper() {
+        let result = PrivilegedHelper.uninstall()
+        state.helperInstalled = PrivilegedHelper.isInstalled
+        if result.ok {
+            NSApp.activate(ignoringOtherApps: true)
+            let alert = NSAlert()
+            alert.messageText = "免密模式已卸载"
+            alert.informativeText = "已删除助手与 sudoers 规则。之后切换合盖模式会重新需要管理员密码。"
+            alert.runModal()
+        } else {
+            showAlert("卸载失败", informative: result.message)
+        }
+    }
+
     // MARK: 动作
 
     @objc private func toggleLid(_ sender: NSMenuItem) {
-        // 授权弹窗不能在菜单追踪事件里同步执行，挪到下一个 runloop
-        DispatchQueue.main.async { [weak self] in
-            self?.performLidToggle()
-        }
+        performLidToggle()
     }
 
     private func performLidToggle() {
-        let current = PMSet.lidSleepDisabled()
-        let turningOn = !(current.battery || current.ac)
-        // 关闭时始终清除全部配置（彻底恢复），开启时按生效条件对应配置
-        let profile = turningOn ? scope.pmsetProfile : "-a"
-        let result = PMSet.setLidSleepDisabled(turningOn, profile: profile)
-        if result.ok {
-            if result.usedGlobalFallback {
-                showAlert("已退回全局设置",
-                          informative: "当前 macOS 不支持按电源类型（插电/电池）分别设置合盖行为，已改为全局\(turningOn ? "开启" : "关闭")“合盖继续工作”。")
+        guard !state.lidBusy else { return }
+        state.lidBusy = true
+        // 授权弹窗不能在菜单追踪事件里同步执行，挪到下一个 runloop
+        DispatchQueue.main.async { [weak self] in
+            guard let self = self else { return }
+            defer { self.state.lidBusy = false }
+            let turningOn = !self.state.lidOn
+            // 关闭时始终清除全部配置（彻底恢复），开启时按生效条件对应配置
+            let profile = turningOn ? self.state.powerScope.pmsetProfile : "-a"
+            let result = PMSet.setLidSleepDisabled(turningOn, profile: profile)
+            if result.ok {
+                if result.usedGlobalFallback {
+                    self.showAlert("已退回全局设置",
+                                   informative: "当前 macOS 不支持按电源类型（插电/电池）分别设置合盖行为，已改为全局\(turningOn ? "开启" : "关闭")\"合盖继续工作\"。")
+                }
+            } else if !result.cancelled {
+                self.showAlert("设置失败",
+                               informative: "执行 pmset 失败：\(result.message)\n\n也可以在终端手动执行：\n/usr/bin/pmset \(profile) disablesleep \(turningOn ? "1" : "0")")
             }
-        } else if !result.cancelled {
-            showAlert("设置失败",
-                      informative: "执行 pmset 失败：\(result.message)\n\n也可以在终端手动执行：\n/usr/bin/pmset \(profile) disablesleep \(turningOn ? "1" : "0")")
+            self.refreshLidState()
+            self.applyAll()
         }
-        let newState = PMSet.lidSleepDisabled()
-        lidOnCached = newState.battery || newState.ac
-        updateIcon()
     }
 
     @objc private func toggleSystemAwake(_ sender: NSMenuItem) {
-        systemAwakeOn.toggle()
-        sender.state = systemAwakeOn ? .on : .off
-        applyAssertions()
+        state.systemAwakeOn.toggle()
+        sender.state = state.systemAwakeOn ? .on : .off
     }
 
     @objc private func toggleDisplayAwake(_ sender: NSMenuItem) {
-        displayAwakeOn.toggle()
-        sender.state = displayAwakeOn ? .on : .off
-        applyAssertions()
+        state.displayAwakeOn.toggle()
+        sender.state = state.displayAwakeOn ? .on : .off
     }
 
     @objc private func setScope(_ sender: NSMenuItem) {
-        guard let raw = sender.representedObject as? Int else { return }
-        scopeRaw = raw
+        guard let raw = sender.representedObject as? Int,
+              let scope = PowerScope(rawValue: raw) else { return }
+        state.powerScope = scope
         for item in sender.menu?.items ?? [] {
             item.state = (item.representedObject as? Int) == raw ? .on : .off
         }
-        applyAssertions()
     }
 
-    @objc private func screenOffNow(_ sender: NSMenuItem) {
-        systemAwakeOn = true
-        applyAssertions()
-        // 稍等菜单收起再熄屏，避免和菜单动画打架
+    @objc private func screenOffAction(_ sender: NSMenuItem) {
+        screenOffNow()
+    }
+
+    private func screenOffNow() {
+        state.systemAwakeOn = true
+        applyAll()
+        // 稍等界面收起再熄屏，避免和动画打架
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) {
             PMSet.run(["displaysleepnow"])
         }
     }
 
-    @objc private func restoreDefaults(_ sender: NSMenuItem) {
-        systemAwakeOn = false
-        displayAwakeOn = false
-        applyAssertions()
+    @objc private func restoreDefaultsAction(_ sender: NSMenuItem) {
+        restoreDefaults()
+    }
+
+    private func restoreDefaults() {
+        state.systemAwakeOn = false
+        state.displayAwakeOn = false
+        batteryGuardTripped = false
+        applyAll()
         DispatchQueue.main.async { [weak self] in
             guard let self = self else { return }
             let result = PMSet.setLidSleepDisabled(false, profile: "-a")
             if result.ok {
-                self.lidOnCached = false
-                self.updateIcon()
+                self.refreshLidState()
                 self.showAlert("已恢复默认", informative: "所有防睡眠模式已关闭，macOS 恢复正常睡眠行为（含合盖睡眠）。")
             } else if !result.cancelled {
                 self.showAlert("恢复失败", informative: "清除 pmset 设置失败：\(result.message)")
@@ -574,30 +468,43 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @objc private func toggleLaunchAtLogin(_ sender: NSMenuItem) {
+        toggleLoginItem()
+    }
+
+    private func toggleLoginItem() {
         do {
             if SMAppService.mainApp.status == .enabled {
                 try SMAppService.mainApp.unregister()
             } else {
                 try SMAppService.mainApp.register()
             }
-            sender.state = (SMAppService.mainApp.status == .enabled) ? .on : .off
+            state.loginItemEnabled = SMAppService.mainApp.status == .enabled
         } catch {
-            showAlert("设置登录项失败", informative: "\(error.localizedDescription)\n\n提示：建议先把「清醒」拖到“应用程序”文件夹后再开启登录启动。")
+            state.loginItemEnabled = SMAppService.mainApp.status == .enabled
+            showAlert("设置登录项失败", informative: "\(error.localizedDescription)\n\n提示：建议先把「清醒」放在\"应用程序\"文件夹后再开启登录启动。")
         }
+    }
+
+    @objc private func openSettings(_ sender: NSMenuItem) {
+        showSettings()
     }
 
     @objc private func showAbout(_ sender: NSMenuItem) {
         let alert = NSAlert()
-        alert.messageText = "清醒 Qingxing v1.0.0"
+        alert.messageText = "清醒 Qingxing v1.1.0"
         alert.informativeText = """
         开源的 macOS 菜单栏防睡眠小工具（简体中文）。
 
-        🌙 合盖继续工作 —— 通过系统 pmset 设置 disablesleep 实现，合上盖子（扣盖）后 Mac 继续运行、屏幕关闭。切换时需要一次管理员密码。
-        🌑 关屏继续工作 —— IOKit 电源断言，屏幕可以正常熄灭，下载 / 编译等任务不中断，无需权限。
-        ☀️ 屏幕常亮 —— 屏幕和系统都不睡眠。
-        ⚡ 生效条件 —— 始终 / 仅插电源时 / 仅用电池时。
+        🌙 合盖继续工作 —— 扣盖不休眠，pmset disablesleep 实现
+        🌑 关屏继续工作 —— IOKit 断言，屏幕可熄、任务不断
+        ☀️ 屏幕常亮 —— 屏幕和系统都不睡眠
+        ⚡ 生效条件 —— 始终 / 仅插电源时 / 仅用电池时
+        🎯 App 触发 —— 指定 App 运行时自动保持唤醒
+        🔑 免密模式 —— 白名单助手 + sudoers，切换不再要密码
+        🛡️ 电池保护 —— 低电量自动恢复睡眠 + 启动自检
 
         注意：合盖运行时请注意散热；用电池合盖运行会持续耗电。
+        设置面板：菜单 → ⚙️ 设置…（⌘,）
         """
         alert.alertStyle = .informational
         NSApp.activate(ignoringOtherApps: true)
@@ -609,7 +516,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func showWelcome() {
         let alert = NSAlert()
         alert.messageText = "「清醒」已开始在菜单栏运行"
-        alert.informativeText = "点击菜单栏的 🌙/☕ 图标即可：\n· 合盖继续工作（扣盖不休眠）\n· 关屏继续工作（屏幕可熄、任务不断）\n· 屏幕常亮\n· 选择“仅插电源 / 仅用电池”时生效\n\n随时可一键恢复 macOS 默认行为。"
+        alert.informativeText = "点击菜单栏的 🌙/☕ 图标即可：\n· 合盖继续工作（扣盖不休眠）\n· 关屏继续工作（屏幕可熄、任务不断）\n· 屏幕常亮 · App 触发 · 电池保护\n· 选择\"仅插电源 / 仅用电池\"时生效\n\n更多选项在 ⚙️ 设置… 中，随时可一键恢复 macOS 默认行为。"
         alert.alertStyle = .informational
         NSApp.activate(ignoringOtherApps: true)
         alert.runModal()

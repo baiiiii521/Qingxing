@@ -8,9 +8,10 @@ APP="dist/Qingxing.app"
 echo "[1/5] 编译主程序..."
 mkdir -p build "$APP/Contents/MacOS" "$APP/Contents/Resources"
 swiftc -O -swift-version 5 -target arm64-apple-macos13.0 \
-    main.swift \
+    main.swift Core.swift Triggers.swift SettingsPanel.swift \
+    -module-name Qingxing \
     -o "$APP/Contents/MacOS/Qingxing" \
-    -framework AppKit -framework IOKit -framework ServiceManagement
+    -framework AppKit -framework IOKit -framework ServiceManagement -framework SwiftUI -framework UserNotifications
 
 echo "[2/5] 生成图标..."
 swift gen_icon.swift
